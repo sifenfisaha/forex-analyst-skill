@@ -1,0 +1,309 @@
+// This source code is subject to the terms of the MIT License.
+// Forex Analyst - CRT + Price Action  (companion to the forex-analyst Claude skill)
+// https://github.com/sifenfisaha/forex-analyst-skill
+//
+// OPEN SOURCE. No password gate. No expiry. No Telegram upsell. Yours to edit.
+//
+// What it draws live:
+//   - Market structure: BOS / CHoCH with swing labels
+//   - CRT range: previous higher-timeframe candle mapped as a range (high/low = liquidity)
+//   - Liquidity: Previous Day High/Low (PDH/PDL) + Asian session range
+//   - Sweeps: highlights when price raids the CRT range / liquidity and closes back inside
+//   - FVG: fair value gap boxes (imbalance)
+//   - Premium/Discount: equilibrium of the CRT range (sell premium / buy discount)
+//   - Killzones: London + NY AM session shading (New York time)
+//   - Signals: long/short when a sweep + structure shift align (optionally inside a killzone)
+//   - Trade levels: auto entry / stop / TP1-3 + RR-to-target + position size, with a 1:3 gate
+//   - Dashboard: bias, session, killzone, premium/discount, sweep status, confluence grade
+//
+// HONEST LIMITS: Pine cannot read chart screenshots, cannot fetch live news / economic-calendar
+// data, and cannot replace human judgment. Use this as your EYES; use the Claude skill as the
+// ANALYST. Pivot-based structure confirms after `pivotLen` bars (standard, not a live promise).
+// This is analysis/education, NOT financial advice. Trading carries real risk of loss.
+
+//@version=5
+indicator("Forex Analyst - CRT + Price Action", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+gGen = "General"
+tz       = input.string("America/New_York", "Timezone", options=["America/New_York", "Europe/London", "UTC", "Asia/Tokyo"], group=gGen, tooltip="All session/killzone times below are interpreted in this timezone. NY time is the institutional standard for CRT/ICT.")
+bullColor = input.color(#16e045, "Bullish color", group=gGen, inline="c")
+bearColor = input.color(#e1320f, "Bearish color", group=gGen, inline="c")
+
+gMS = "Market Structure"
+showMS   = input.bool(true,  "Show structure (BOS / CHoCH)", group=gMS)
+pivotLen = input.int(10, "Swing pivot length", minval=2, maxval=50, group=gMS, tooltip="Larger = only major swings. Pivots confirm this many bars after they form.")
+
+gCRT = "CRT Range"
+showCRT = input.bool(true, "Show CRT range (HTF candle)", group=gCRT)
+crtTF   = input.timeframe("D", "CRT higher timeframe", group=gCRT, tooltip="The HTF candle mapped as a range. Daily/H4/H1 give the cleanest CRT ranges. Use a TF higher than your chart.")
+crtColor= input.color(color.new(#2962ff, 0), "CRT range color", group=gCRT)
+
+gLiq = "Liquidity"
+showPDHL  = input.bool(true, "Show Previous Day High/Low", group=gLiq)
+showAsian = input.bool(true, "Show Asian session range", group=gLiq)
+asianSess = input.session("2000-0000", "Asian session", group=gLiq, tooltip="Builds the liquidity London sweeps. Default 8pm-12am NY time.")
+
+gFVG = "Fair Value Gaps"
+showFVG    = input.bool(true, "Show FVG boxes", group=gFVG)
+fvgExtend  = input.int(12, "FVG box extend (bars)", minval=1, maxval=100, group=gFVG)
+
+gPD = "Premium / Discount"
+showPD = input.bool(true, "Shade premium / discount of CRT range", group=gPD)
+
+gKZ = "Killzones"
+showKZ     = input.bool(true, "Shade killzones", group=gKZ)
+londonKZ   = input.session("0200-0500", "London killzone", group=gKZ, tooltip="NY time. The day's first manipulation window.")
+nyamKZ     = input.session("0700-1000", "New York AM killzone", group=gKZ, tooltip="NY time. News-driven displacement window.")
+
+gSig = "Signals"
+showSignals = input.bool(true, "Show Buy/Sell signals", group=gSig)
+requireKZ   = input.bool(true, "Only signal inside a killzone", group=gSig)
+sweepLookback = input.int(20, "Sweep validity (bars)", minval=2, maxval=100, group=gSig, tooltip="A sweep stays 'armed' for this many bars while waiting for the structure shift.")
+
+gRisk = "Risk & Trade Levels"
+showTrade = input.bool(true, "Auto-draw trade levels", group=gRisk)
+acct      = input.float(10000, "Account size (USD)", minval=0, group=gRisk)
+riskPct   = input.float(1.0, "Risk % per trade", minval=0.0, maxval=5.0, step=0.1, group=gRisk, tooltip="The skill's rule is 0.5-1%.")
+minRR     = input.float(3.0, "Minimum reward-to-risk", minval=0.5, step=0.5, group=gRisk, tooltip="The skill rejects setups under 1:3.")
+pipSize   = input.float(0.0001, "Pip size", step=0.0001, group=gRisk, tooltip="0.0001 for most FX, 0.01 for JPY pairs and Gold. Broker-dependent.")
+pipValue  = input.float(10.0, "Pip value per 1.0 lot (USD)", minval=0, group=gRisk, tooltip="~$10 for USD-quote majors per standard lot. Confirm with your broker for JPY/metals.")
+riskBuffer= input.float(0.15, "Stop buffer (x ATR)", minval=0, step=0.05, group=gRisk)
+
+gDash = "Dashboard"
+showDash = input.bool(true, "Show dashboard", group=gDash)
+dashPos  = input.string("Bottom Right", "Position", options=["Top Right","Middle Right","Bottom Right","Top Left","Middle Left","Bottom Left","Top Center","Bottom Center"], group=gDash)
+dashSize = input.string("Small", "Size", options=["Tiny","Small","Normal","Large"], group=gDash)
+
+// ============================================================================
+// MARKET STRUCTURE  (BOS / CHoCH)
+// ============================================================================
+ph = ta.pivothigh(pivotLen, pivotLen)
+pl = ta.pivotlow(pivotLen, pivotLen)
+
+var float upLevel = na
+var float dnLevel = na
+upLevel := not na(ph) ? ph : upLevel
+dnLevel := not na(pl) ? pl : dnLevel
+
+bullBreak = not na(upLevel) and ta.crossover(close, upLevel)
+bearBreak = not na(dnLevel) and ta.crossunder(close, dnLevel)
+
+var int dir = 0   // current chart-TF structure bias: 1 bull, -1 bear
+if bullBreak
+    isChoch = dir < 0
+    if showMS
+        label.new(bar_index, low, isChoch ? "CHoCH +" : "BOS +", style=label.style_label_up, color=color.new(bullColor, 15), textcolor=color.white, size=size.small)
+    dir := 1
+if bearBreak
+    isChoch = dir > 0
+    if showMS
+        label.new(bar_index, high, isChoch ? "CHoCH -" : "BOS -", style=label.style_label_down, color=color.new(bearColor, 15), textcolor=color.white, size=size.small)
+    dir := -1
+
+// ============================================================================
+// CRT RANGE  (previous HTF candle high/low, non-repainting)
+// ============================================================================
+htfHigh = request.security(syminfo.tickerid, crtTF, high[1], lookahead=barmerge.lookahead_on)
+htfLow  = request.security(syminfo.tickerid, crtTF, low[1],  lookahead=barmerge.lookahead_on)
+crtEq   = (htfHigh + htfLow) / 2.0
+
+pCrtHi = plot(showCRT ? htfHigh : na, "CRT High", color = showCRT ? color.new(crtColor, 0) : na, linewidth=2, style=plot.style_linebr)
+pCrtEq = plot(showCRT ? crtEq   : na, "CRT Equilibrium", color = showCRT ? color.new(color.gray, 30) : na, linewidth=1, style=plot.style_linebr)
+pCrtLo = plot(showCRT ? htfLow  : na, "CRT Low", color = showCRT ? color.new(crtColor, 0) : na, linewidth=2, style=plot.style_linebr)
+
+// Premium / Discount shading of the CRT range
+fill(pCrtHi, pCrtEq, showPD ? color.new(bearColor, 92) : na, title="Premium (sell zone)")
+fill(pCrtEq, pCrtLo, showPD ? color.new(bullColor, 92) : na, title="Discount (buy zone)")
+
+// ============================================================================
+// LIQUIDITY  (PDH/PDL + Asian range)
+// ============================================================================
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+plot(showPDHL ? pdh : na, "PDH", color = showPDHL ? color.new(color.orange, 0) : na, linewidth=1, style=plot.style_linebr)
+plot(showPDHL ? pdl : na, "PDL", color = showPDHL ? color.new(color.orange, 0) : na, linewidth=1, style=plot.style_linebr)
+
+inAsian = not na(time(timeframe.period, asianSess, tz))
+var float asianHi = na
+var float asianLo = na
+if inAsian and not inAsian[1]
+    asianHi := high
+    asianLo := low
+else if inAsian
+    asianHi := math.max(nz(asianHi, high), high)
+    asianLo := math.min(nz(asianLo, low),  low)
+plot(showAsian ? asianHi : na, "Asian High", color = showAsian ? color.new(color.purple, 0) : na, linewidth=1, style=plot.style_linebr)
+plot(showAsian ? asianLo : na, "Asian Low",  color = showAsian ? color.new(color.purple, 0) : na, linewidth=1, style=plot.style_linebr)
+
+// ============================================================================
+// SWEEP DETECTION  (raid of the CRT range, close back inside = manipulation)
+// ============================================================================
+sweptHigh = high > htfHigh and close < htfHigh
+sweptLow  = low  < htfLow  and close > htfLow
+
+var int sweepHighBar = na
+var int sweepLowBar  = na
+if sweptHigh
+    sweepHighBar := bar_index
+if sweptLow
+    sweepLowBar := bar_index
+
+sweepHighActive = not na(sweepHighBar) and (bar_index - sweepHighBar) <= sweepLookback
+sweepLowActive  = not na(sweepLowBar)  and (bar_index - sweepLowBar)  <= sweepLookback
+
+plotshape(showCRT and sweptHigh, "Sweep High", shape.triangledown, location.abovebar, color.new(bearColor, 0), size=size.tiny)
+plotshape(showCRT and sweptLow,  "Sweep Low",  shape.triangleup,   location.belowbar, color.new(bullColor, 0), size=size.tiny)
+
+// ============================================================================
+// FAIR VALUE GAPS  (3-candle imbalance)
+// ============================================================================
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+if showFVG and bullFVG
+    box.new(bar_index[2], low, bar_index + fvgExtend, high[2], border_color=color.new(bullColor, 40), bgcolor=color.new(bullColor, 85))
+if showFVG and bearFVG
+    box.new(bar_index[2], low[2], bar_index + fvgExtend, high, border_color=color.new(bearColor, 40), bgcolor=color.new(bearColor, 85))
+
+// ============================================================================
+// KILLZONES  (London + NY AM, shaded)
+// ============================================================================
+inLondonKZ = not na(time(timeframe.period, londonKZ, tz))
+inNYAMKZ   = not na(time(timeframe.period, nyamKZ,   tz))
+bgcolor(showKZ and inLondonKZ ? color.new(#2962ff, 90) : na, title="London KZ")
+bgcolor(showKZ and inNYAMKZ   ? color.new(#ff9800, 90) : na, title="NY AM KZ")
+inKZ = inLondonKZ or inNYAMKZ
+
+// ============================================================================
+// SIGNALS  (sweep + structure shift; optionally inside a killzone)
+// ============================================================================
+atr = ta.atr(14)
+swLowLevel  = ta.lowest(low, sweepLookback)    // computed globally (ta.* must not live inside a conditional)
+swHighLevel = ta.highest(high, sweepLookback)
+longSignal  = showSignals and sweepLowActive  and bullBreak and (not requireKZ or inKZ)
+shortSignal = showSignals and sweepHighActive and bearBreak and (not requireKZ or inKZ)
+
+if longSignal
+    sweepLowBar := na
+if shortSignal
+    sweepHighBar := na
+
+plotshape(longSignal,  "Buy",  shape.labelup,   location.belowbar, color.new(bullColor, 0), text="BUY",  textcolor=color.white, size=size.small)
+plotshape(shortSignal, "Sell", shape.labeldown, location.abovebar, color.new(bearColor, 0), text="SELL", textcolor=color.white, size=size.small)
+
+// ============================================================================
+// TRADE LEVELS  (entry / stop / TP1-3 + RR + position size, 1:3 gate)
+// ============================================================================
+var line  lnEntry = na
+var line  lnStop  = na
+var line  lnT1    = na
+var line  lnT2    = na
+var line  lnT3    = na
+var label lbTrade = na
+
+var float tEntry = na
+var float tStop  = na
+var float tRRtarget = na
+var float tLots = na
+var bool  tPass = false
+var int   tDir  = 0
+
+makeTrade(bool isLong) =>
+    buf  = atr * riskBuffer
+    sw   = isLong ? swLowLevel : swHighLevel
+    entry= close
+    stop = isLong ? sw - buf : sw + buf
+    risk = math.abs(entry - stop)
+    tgt  = isLong ? htfHigh : htfLow          // opposite CRT edge = liquidity target
+    rr   = risk > 0 ? math.abs(tgt - entry) / risk : 0
+    t1   = isLong ? entry + risk * 1 : entry - risk * 1
+    t2   = isLong ? entry + risk * 2 : entry - risk * 2
+    t3   = isLong ? entry + risk * 3 : entry - risk * 3
+    stopPips = risk / pipSize
+    lots = (stopPips > 0 and pipValue > 0) ? (acct * riskPct / 100.0) / (stopPips * pipValue) : 0
+    [entry, stop, t1, t2, t3, rr, lots]
+
+if showTrade and (longSignal or shortSignal)
+    isLong = longSignal
+    [entry, stop, t1, t2, t3, rr, lots] = makeTrade(isLong)
+    tEntry := entry
+    tStop := stop
+    tRRtarget := rr
+    tLots := lots
+    tPass := rr >= minRR
+    tDir := isLong ? 1 : -1
+
+    line.delete(lnEntry)
+    line.delete(lnStop)
+    line.delete(lnT1)
+    line.delete(lnT2)
+    line.delete(lnT3)
+    label.delete(lbTrade)
+
+    col = isLong ? bullColor : bearColor
+    lnEntry := line.new(bar_index, entry, bar_index + 30, entry, color=color.orange, style=line.style_solid,  extend=extend.right)
+    lnStop  := line.new(bar_index, stop,  bar_index + 30, stop,  color=bearColor,    style=line.style_dashed, extend=extend.right)
+    lnT1    := line.new(bar_index, t1,    bar_index + 30, t1,    color=bullColor,    style=line.style_dotted, extend=extend.right)
+    lnT2    := line.new(bar_index, t2,    bar_index + 30, t2,    color=bullColor,    style=line.style_dotted, extend=extend.right)
+    lnT3    := line.new(bar_index, t3,    bar_index + 30, t3,    color=bullColor,    style=line.style_dotted, extend=extend.right)
+
+    gate = tPass ? "OK RR " + str.tostring(rr, "#.##") + " (>=" + str.tostring(minRR, "#.#") + ")" : "X RR " + str.tostring(rr, "#.##") + " < " + str.tostring(minRR, "#.#") + " - skip"
+    txt = (isLong ? "LONG" : "SHORT") + "\nEntry " + str.tostring(entry, format.mintick) + "\nStop " + str.tostring(stop, format.mintick) + "\nTarget " + str.tostring(isLong ? htfHigh : htfLow, format.mintick) + "\nSize " + str.tostring(lots, "#.##") + " lots\n" + gate
+    lbTrade := label.new(bar_index, isLong ? stop : t3, txt, style=isLong ? label.style_label_up : label.style_label_down, color=color.new(color.black, 20), textcolor=color.white, size=size.small)
+
+// ============================================================================
+// CONFLUENCE GRADE  (mirrors the skill's scorecard, lightweight)
+// ============================================================================
+biasStr   = dir == 1 ? "Bullish" : dir == -1 ? "Bearish" : "Neutral"
+sessStr   = inLondonKZ ? "London KZ" : inNYAMKZ ? "NY AM KZ" : "Outside KZ"
+pdStr     = close > crtEq ? "Premium (sell)" : "Discount (buy)"
+sweepStr  = sweepHighActive ? "High swept" : sweepLowActive ? "Low swept" : "None"
+
+c_bias  = dir != 0 ? 1 : 0
+c_kz    = inKZ ? 1 : 0
+c_sweep = (sweepHighActive or sweepLowActive) ? 1 : 0
+c_pd    = (dir == 1 and close < crtEq) or (dir == -1 and close > crtEq) ? 1 : 0
+c_rr    = tPass ? 1 : 0
+score   = c_bias + c_kz + c_sweep + c_pd + c_rr
+gradeStr = score >= 4 ? "A - strong" : score == 3 ? "B - valid" : score == 2 ? "C - wait" : "D - no trade"
+gradeCol = score >= 4 ? bullColor : score == 3 ? color.new(bullColor, 40) : score == 2 ? color.orange : color.gray
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+var table dash = na
+posMap = dashPos == "Top Right" ? position.top_right : dashPos == "Middle Right" ? position.middle_right : dashPos == "Bottom Right" ? position.bottom_right : dashPos == "Top Left" ? position.top_left : dashPos == "Middle Left" ? position.middle_left : dashPos == "Bottom Left" ? position.bottom_left : dashPos == "Top Center" ? position.top_center : position.bottom_center
+szMap  = dashSize == "Tiny" ? size.tiny : dashSize == "Small" ? size.small : dashSize == "Normal" ? size.normal : size.large
+
+if showDash and barstate.islast
+    if na(dash)
+        dash := table.new(posMap, 2, 8, border_width=1, border_color=color.new(color.gray, 50), frame_width=1, frame_color=color.new(color.gray, 50))
+    cBg = color.new(#1e222d, 10)
+    table.cell(dash, 0, 0, "FOREX ANALYST - CRT", text_color=color.white, bgcolor=color.new(crtColor, 0), text_size=szMap)
+    table.cell(dash, 1, 0, "", bgcolor=color.new(crtColor, 0), text_size=szMap)
+    table.cell(dash, 0, 1, "Bias",            text_color=color.white, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 1, 1, biasStr,           text_color = dir==1?bullColor:dir==-1?bearColor:color.gray, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 0, 2, "Session",         text_color=color.white, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 1, 2, sessStr,           text_color = inKZ?bullColor:color.gray, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 0, 3, "Range zone",      text_color=color.white, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 1, 3, pdStr,             text_color = close>crtEq?bearColor:bullColor, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 0, 4, "CRT sweep",       text_color=color.white, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 1, 4, sweepStr,          text_color = (sweepHighActive or sweepLowActive)?color.orange:color.gray, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 0, 5, "Last setup RR",   text_color=color.white, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 1, 5, na(tRRtarget)?"-":str.tostring(tRRtarget,"#.##"), text_color = tPass?bullColor:bearColor, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 0, 6, "Size (lots)",     text_color=color.white, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 1, 6, na(tLots)?"-":str.tostring(tLots,"#.##"), text_color=color.white, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 0, 7, "Confluence",      text_color=color.white, bgcolor=cBg, text_size=szMap)
+    table.cell(dash, 1, 7, str.tostring(score) + "/5  " + gradeStr, text_color=gradeCol, bgcolor=cBg, text_size=szMap)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(longSignal,  "Buy signal",  "Forex Analyst: BUY (sweep + bullish shift)")
+alertcondition(shortSignal, "Sell signal", "Forex Analyst: SELL (sweep + bearish shift)")
+alertcondition(sweptHigh,   "CRT high swept", "Forex Analyst: CRT range HIGH swept")
+alertcondition(sweptLow,    "CRT low swept",  "Forex Analyst: CRT range LOW swept")
+alertcondition(bullBreak,   "Bullish structure break", "Forex Analyst: bullish BOS/CHoCH")
+alertcondition(bearBreak,   "Bearish structure break", "Forex Analyst: bearish BOS/CHoCH")

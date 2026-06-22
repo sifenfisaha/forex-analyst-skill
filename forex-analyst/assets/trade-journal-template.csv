@@ -1,0 +1,3 @@
+Date,Time(ET),Pair,Direction,Session,Grade,ScorecardPts,Entry,Stop,TP1,TP2,RiskPct,RR_Planned,Sweep(WhichLiquidity),Confirmation(MSS/FVG/OB),Target(DrawOnLiquidity),NewsFlag,Outcome(R),FollowedPlan(Y/N),EmotionalState,Screenshot_Before,Screenshot_After,Notes(1 thing done well / 1 to fix)
+2026-06-19,03:15,EURUSD,LONG,London KZ,A+,8,1.0850,1.0830,1.0890,1.0910,1.0,3.0,Swept Asian low + PDL,M5 MSS + FVG,PDH buy-side,clear,+3.0,Y,calm,,,Waited for sweep then shift; let it run to TP2
+2026-06-19,08:40,GBPUSD,SHORT,NY AM KZ,B,5,1.2710,1.2728,1.2674,,0.5,2.8,Swept London high,M5 CHoCH (no displacement),equal lows,clear,-1.0,Y,calm,,,Followed plan; lost — fine. B-grade so half size
